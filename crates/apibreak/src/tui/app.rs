@@ -3,11 +3,14 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Duration;
 
-use apibreak_core::{Exchange, Store, StoreEvent};
+use apibreak_core::{
+    Action as Effect, Exchange, Scenario, ScenarioHandle, ScenarioSet, Store, StoreEvent,
+};
 use ratatui::text::Line;
 
-use super::keymap::Action;
+use super::keymap::{Action, Break};
 use super::view;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +34,10 @@ struct DetailCache {
 
 pub struct App {
     store: Arc<Store>,
+    scenarios: ScenarioHandle,
+    default_delay: Duration,
+    /// Active scenarios as last seen on the watch channel.
+    pub active: Arc<ScenarioSet>,
     pub title: String,
     entries: VecDeque<Arc<Exchange>>,
     selected_id: Option<u64>,
@@ -48,9 +55,17 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(store: Arc<Store>, title: String) -> Self {
+    pub fn new(
+        store: Arc<Store>,
+        scenarios: ScenarioHandle,
+        default_delay: Duration,
+        title: String,
+    ) -> Self {
         Self {
             store,
+            active: scenarios.current(),
+            scenarios,
+            default_delay,
             title,
             entries: VecDeque::new(),
             selected_id: None,
@@ -175,7 +190,38 @@ impl App {
             Action::TogglePause => self.paused = !self.paused,
             Action::ToggleHelp => self.mode = Mode::Help,
             Action::CloseHelp => self.mode = Mode::Normal,
+            Action::Break(kind) => self.toggle_scenario(kind),
+            Action::ClearScenarios => {
+                if let Some(exchange) = self.selected() {
+                    let current = self.scenarios.current();
+                    let endpoint = current.endpoint_for(&exchange.method, &exchange.path);
+                    self.scenarios.update(|set| set.clear(&endpoint));
+                }
+            }
         }
+    }
+
+    #[cfg(test)]
+    pub fn scenarios_for_test(&self) -> Arc<ScenarioSet> {
+        self.scenarios.current()
+    }
+
+    fn toggle_scenario(&mut self, kind: Break) {
+        let Some(exchange) = self.selected() else {
+            return;
+        };
+        let action = match kind {
+            Break::Status500 => Effect::Status(500),
+            Break::Status401 => Effect::Status(401),
+            Break::Status404 => Effect::Status(404),
+            Break::Empty => Effect::Empty,
+            Break::Delay => Effect::Delay(self.default_delay),
+            Break::Offline => Effect::Offline,
+        };
+        let current = self.scenarios.current();
+        let endpoint = current.endpoint_for(&exchange.method, &exchange.path);
+        self.scenarios
+            .update(|set| set.toggle(Scenario { endpoint, action }));
     }
 
     fn move_by(&mut self, delta: i32) {
@@ -238,11 +284,16 @@ mod tests {
         });
     }
 
+    fn new_app(store: Arc<Store>) -> App {
+        let scenarios = ScenarioHandle::new(ScenarioSet::default());
+        App::new(store, scenarios, Duration::from_secs(3), String::new())
+    }
+
     /// An app with `paths` already delivered through the event channel.
     fn app_with(paths: &[&str]) -> App {
         let store = Arc::new(Store::new(3));
         let mut events = store.subscribe();
-        let mut app = App::new(store.clone(), String::new());
+        let mut app = new_app(store.clone());
         for path in paths {
             add(&store, path);
         }
@@ -301,7 +352,7 @@ mod tests {
     fn pause_ignores_new_requests() {
         let store = Arc::new(Store::new(3));
         let mut events = store.subscribe();
-        let mut app = App::new(store.clone(), String::new());
+        let mut app = new_app(store.clone());
         app.handle(Action::TogglePause);
         add(&store, "/a");
         app.apply_event(events.try_recv().expect("event"));
@@ -327,6 +378,34 @@ mod tests {
         }
         assert_eq!(app.detail_scroll, 1);
         assert_eq!(selected_path(&app), "/b");
+    }
+
+    #[test]
+    fn keys_toggle_scenarios_on_the_templated_endpoint() {
+        let mut app = app_with(&["/api/users/7"]);
+        app.handle(Action::Break(Break::Status500));
+        app.handle(Action::Break(Break::Delay));
+        assert_eq!(
+            app.scenarios.current().summary(),
+            ["GET /api/users/:id → 500 + delay 3s"]
+        );
+
+        app.handle(Action::Break(Break::Status500));
+        assert_eq!(
+            app.scenarios.current().summary(),
+            ["GET /api/users/:id → delay 3s"]
+        );
+
+        app.handle(Action::ClearScenarios);
+        assert!(app.scenarios.current().is_empty());
+    }
+
+    #[test]
+    fn scenario_keys_without_a_selection_do_nothing() {
+        let mut app = app_with(&[]);
+        app.handle(Action::Break(Break::Offline));
+        app.handle(Action::ClearScenarios);
+        assert!(app.scenarios.current().is_empty());
     }
 
     #[test]

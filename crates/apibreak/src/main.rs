@@ -2,10 +2,12 @@ mod tui;
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use apibreak_core::scenario::{parse_duration, DEFAULT_DELAY};
 use apibreak_core::store::DEFAULT_CAPACITY;
-use apibreak_core::{Proxy, ProxyConfig, Store};
+use apibreak_core::{Proxy, ProxyConfig, ScenarioHandle, ScenarioSet, Store};
 use clap::{ArgAction, Parser};
 use tokio::net::TcpListener;
 
@@ -28,6 +30,9 @@ struct Cli {
     /// How many requests to keep in memory
     #[arg(long, default_value_t = DEFAULT_CAPACITY)]
     history: usize,
+    /// Delay applied by the `d` key, e.g. 500ms, 3s, 2m
+    #[arg(long, value_parser = parse_duration)]
+    delay: Option<Duration>,
 }
 
 /// Binds IPv4 loopback, and IPv6 too because `localhost` may resolve to `::1`.
@@ -54,12 +59,14 @@ fn main() -> Result<()> {
         target: target.clone(),
         cors: cli.cors,
     };
-    let proxy = Proxy::new(config, store.clone())?;
+    let scenarios = ScenarioHandle::new(ScenarioSet::default());
+    let proxy = Proxy::new(config, store.clone(), scenarios.clone())?;
 
     let runtime = tokio::runtime::Runtime::new().context("cannot start the runtime")?;
     let listeners = runtime.block_on(bind(port))?;
     for listener in listeners {
         runtime.spawn(proxy.clone().serve(listener));
     }
-    tui::run(store, format!(":{port} -> {target}"))
+    let delay = cli.delay.unwrap_or(DEFAULT_DELAY);
+    tui::run(store, scenarios, delay, format!(":{port} -> {target}"))
 }

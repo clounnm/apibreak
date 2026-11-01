@@ -24,9 +24,10 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 use url::Url;
 
-use crate::cors;
 use crate::error::{Error, Result};
+use crate::scenario::{Action, Plan, Scenario, ScenarioHandle};
 use crate::store::{Captured, Headers, NewExchange, Outcome, ResponseRecord, Store, CAPTURE_LIMIT};
+use crate::{body as body_view, cors};
 
 /// Request bodies are buffered before forwarding, so they need a ceiling.
 const MAX_REQUEST_BODY: usize = 256 * 1024 * 1024;
@@ -56,6 +57,7 @@ struct Inner {
     cors: bool,
     client: reqwest::Client,
     store: Arc<Store>,
+    scenarios: ScenarioHandle,
 }
 
 /// Makes hyper close the connection without writing a response.
@@ -64,7 +66,7 @@ struct Inner {
 struct DropConnection;
 
 impl Proxy {
-    pub fn new(config: ProxyConfig, store: Arc<Store>) -> Result<Self> {
+    pub fn new(config: ProxyConfig, store: Arc<Store>, scenarios: ScenarioHandle) -> Result<Self> {
         let url =
             Url::parse(&config.target).map_err(|_| Error::InvalidTarget(config.target.clone()))?;
         if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
@@ -84,6 +86,7 @@ impl Proxy {
                 cors: config.cors,
                 client,
                 store,
+                scenarios,
             }),
         })
     }
@@ -127,15 +130,24 @@ impl Proxy {
         let body = body.map(|body| body.to_bytes()).unwrap_or_default();
 
         let started = Instant::now();
+        // A preflight has to succeed for the real request to be sent at all,
+        // so scenarios apply to the real request only.
+        let preflight = origin.is_some() && cors::is_preflight(&parts.method, &parts.headers);
+        let plan = if preflight {
+            None
+        } else {
+            let scenarios = self.inner.scenarios.current();
+            scenarios.plan(parts.method.as_str(), parts.uri.path())
+        };
         let id = self.inner.store.begin(NewExchange {
             method: parts.method.to_string(),
             path: parts.uri.path().to_owned(),
             uri: path_and_query(&parts.uri).to_owned(),
             request_headers: header_list(&parts.headers),
             request_body: Captured::new(body.clone()),
-            scenario: None,
+            scenario: plan.as_ref().map(|plan| plan.label.clone()),
         });
-        let recording = Recording::new(self.inner.store.clone(), id, started);
+        let mut recording = Recording::new(self.inner.store.clone(), id, started);
 
         if too_large {
             let response = error_response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
@@ -148,10 +160,60 @@ impl Proxy {
                 return Ok(finish(response, recording, None));
             }
         }
+        if let Some(Plan {
+            delay, response, ..
+        }) = plan
+        {
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            if let Some(scenario) = response {
+                let response = match self.scenario_response(&scenario) {
+                    Some(response) => response,
+                    None => {
+                        recording.failure = Some("connection dropped by scenario".to_owned());
+                        return Err(DropConnection);
+                    }
+                };
+                return Ok(finish(response, recording, origin.as_ref()));
+            }
+        }
         let response = self
             .forward(parts.method, &parts.uri, &parts.headers, body)
             .await;
         Ok(finish(response, recording, origin.as_ref()))
+    }
+
+    /// Builds the response a scenario calls for; `None` drops the connection.
+    fn scenario_response(&self, scenario: &Scenario) -> Option<Response<ProxyBody>> {
+        Some(match &scenario.action {
+            Action::Status(status) => status_response(*status),
+            Action::Empty => self.empty_response(scenario),
+            Action::Offline => return None,
+            // Delays are applied before this point and never decide a response.
+            Action::Delay(_) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "invalid plan"),
+        })
+    }
+
+    /// `[]` if the endpoint last answered with an array, otherwise 204.
+    fn empty_response(&self, scenario: &Scenario) -> Response<ProxyBody> {
+        let last_real = self.inner.store.latest(|entry| {
+            entry.scenario.is_none()
+                && matches!(entry.outcome, Outcome::Response(_))
+                && scenario.endpoint.matches(&entry.method, &entry.path)
+        });
+        let was_array = last_real.is_some_and(|entry| match &entry.outcome {
+            Outcome::Response(response) => {
+                let decoded = body_view::decode(&response.headers, &response.body);
+                body_view::is_json_array(&decoded.bytes)
+            }
+            _ => false,
+        });
+        if was_array {
+            json_response(StatusCode::OK, Bytes::from_static(b"[]"))
+        } else {
+            respond(StatusCode::NO_CONTENT, HeaderMap::new(), Bytes::new())
+        }
     }
 
     async fn forward(
@@ -232,6 +294,7 @@ struct Recording {
     id: u64,
     started: Instant,
     response: Option<(u16, Headers)>,
+    failure: Option<String>,
     captured: BytesMut,
     truncated: bool,
     ended: bool,
@@ -244,6 +307,7 @@ impl Recording {
             id,
             started,
             response: None,
+            failure: None,
             captured: BytesMut::new(),
             truncated: false,
             ended: false,
@@ -269,7 +333,11 @@ impl Drop for Recording {
                     truncated: self.truncated || !self.ended,
                 },
             }),
-            None => Outcome::Failed("client disconnected".to_owned()),
+            None => Outcome::Failed(
+                self.failure
+                    .take()
+                    .unwrap_or_else(|| "client disconnected".to_owned()),
+            ),
         };
         self.store.finish(self.id, outcome, self.started.elapsed());
     }
@@ -392,14 +460,29 @@ fn respond(status: StatusCode, headers: HeaderMap, body: Bytes) -> Response<Prox
     response
 }
 
-fn error_response(status: StatusCode, message: &str) -> Response<ProxyBody> {
-    let body = serde_json::json!({ "error": message }).to_string();
+fn json_response(status: StatusCode, body: Bytes) -> Response<ProxyBody> {
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
     );
-    respond(status, headers, Bytes::from(body))
+    respond(status, headers, body)
+}
+
+fn error_response(status: StatusCode, message: &str) -> Response<ProxyBody> {
+    let body = serde_json::json!({ "error": message }).to_string();
+    json_response(status, Bytes::from(body))
+}
+
+/// The answer to a status scenario.
+fn status_response(status: u16) -> Response<ProxyBody> {
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let message = match status {
+        StatusCode::UNAUTHORIZED => "token_expired",
+        other => other.canonical_reason().unwrap_or("error"),
+    };
+    let body = serde_json::json!({ "error": message, "source": "apibreak" });
+    json_response(status, Bytes::from(body.to_string()))
 }
 
 #[cfg(test)]
@@ -429,14 +512,12 @@ mod tests {
 
     #[test]
     fn rewrites_only_redirects_into_the_target() {
-        let proxy = Proxy::new(
-            ProxyConfig {
-                target: "https://api.example.com/v1/".into(),
-                cors: true,
-            },
-            Arc::new(Store::new(1)),
-        )
-        .expect("proxy");
+        let config = ProxyConfig {
+            target: "https://api.example.com/v1/".into(),
+            cors: true,
+        };
+        let scenarios = ScenarioHandle::new(Default::default());
+        let proxy = Proxy::new(config, Arc::new(Store::new(1)), scenarios).expect("proxy");
         for (location, expected) in [
             ("https://api.example.com/v1/users?a=1", "/users?a=1"),
             ("https://api.example.com/v1", "/"),
@@ -464,7 +545,11 @@ mod tests {
                 target: target.into(),
                 cors: true,
             };
-            let result = Proxy::new(config, Arc::new(Store::new(1)));
+            let result = Proxy::new(
+                config,
+                Arc::new(Store::new(1)),
+                ScenarioHandle::new(Default::default()),
+            );
             assert!(matches!(result, Err(Error::InvalidTarget(_))));
         }
     }

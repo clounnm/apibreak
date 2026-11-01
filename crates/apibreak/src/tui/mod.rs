@@ -14,25 +14,38 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use apibreak_core::Store;
+use apibreak_core::{ScenarioHandle, ScenarioSet, Store};
 use crossterm::event::{self, Event};
 use ratatui::DefaultTerminal;
 use tokio::sync::broadcast::error::TryRecvError;
+use tokio::sync::watch;
 
 use app::App;
 
 const TICK: Duration = Duration::from_millis(40);
 
 /// Runs the UI until the user quits. `title` is shown in the header.
-pub fn run(store: Arc<Store>, title: String) -> Result<()> {
+pub fn run(
+    store: Arc<Store>,
+    scenarios: ScenarioHandle,
+    default_delay: Duration,
+    title: String,
+) -> Result<()> {
     // Installs a panic hook that leaves raw mode and the alternate screen.
     let mut terminal = ratatui::try_init().context("cannot set up the terminal")?;
-    let result = event_loop(&mut terminal, App::new(store.clone(), title), &store);
+    let mut watcher = scenarios.subscribe();
+    let app = App::new(store.clone(), scenarios, default_delay, title);
+    let result = event_loop(&mut terminal, app, &store, &mut watcher);
     let restored = ratatui::try_restore().context("cannot restore the terminal");
     result.and(restored)
 }
 
-fn event_loop(terminal: &mut DefaultTerminal, mut app: App, store: &Store) -> Result<()> {
+fn event_loop(
+    terminal: &mut DefaultTerminal,
+    mut app: App,
+    store: &Store,
+    scenarios: &mut watch::Receiver<Arc<ScenarioSet>>,
+) -> Result<()> {
     let mut events = store.subscribe();
     app.resync(store.snapshot());
     let mut dirty = true;
@@ -43,6 +56,10 @@ fn event_loop(terminal: &mut DefaultTerminal, mut app: App, store: &Store) -> Re
                 Err(TryRecvError::Lagged(_)) => app.resync(store.snapshot()),
                 Err(TryRecvError::Empty | TryRecvError::Closed) => break,
             }
+            dirty = true;
+        }
+        if scenarios.has_changed().unwrap_or(false) {
+            app.active = scenarios.borrow_and_update().clone();
             dirty = true;
         }
         if dirty {

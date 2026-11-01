@@ -21,6 +21,19 @@ pub enum Action {
     TogglePause,
     ToggleHelp,
     CloseHelp,
+    Break(Break),
+    ClearScenarios,
+}
+
+/// A scenario key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Break {
+    Status500,
+    Status401,
+    Status404,
+    Empty,
+    Delay,
+    Offline,
 }
 
 pub fn action(mode: Mode, key: KeyEvent) -> Option<Action> {
@@ -53,6 +66,13 @@ fn normal(code: KeyCode) -> Option<Action> {
         KeyCode::Char('c') => Action::Clear,
         KeyCode::Char('p') => Action::TogglePause,
         KeyCode::Char('?') => Action::ToggleHelp,
+        KeyCode::Char('5') => Action::Break(Break::Status500),
+        KeyCode::Char('4') => Action::Break(Break::Status401),
+        KeyCode::Char('n') => Action::Break(Break::Status404),
+        KeyCode::Char('e') => Action::Break(Break::Empty),
+        KeyCode::Char('d') => Action::Break(Break::Delay),
+        KeyCode::Char('o') => Action::Break(Break::Offline),
+        KeyCode::Char('x') => Action::ClearScenarios,
         _ => return None,
     })
 }

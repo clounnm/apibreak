@@ -3,7 +3,9 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use apibreak_core::{Exchange, Outcome, Proxy, ProxyConfig, Store};
+use apibreak_core::{
+    Action, Exchange, Outcome, Proxy, ProxyConfig, Scenario, ScenarioHandle, ScenarioSet, Store,
+};
 use support::{backend, send, Backend};
 use tokio::net::TcpListener;
 
@@ -12,16 +14,26 @@ async fn start_proxy(backend: &Backend, cors: bool) -> u16 {
 }
 
 async fn start_recording(backend: &Backend, cors: bool) -> (u16, Arc<Store>) {
+    let (port, store, _) = start_with(backend, cors, ScenarioSet::default()).await;
+    (port, store)
+}
+
+async fn start_with(
+    backend: &Backend,
+    cors: bool,
+    scenarios: ScenarioSet,
+) -> (u16, Arc<Store>, ScenarioHandle) {
+    let scenarios = ScenarioHandle::new(scenarios);
     let store = Arc::new(Store::new(16));
     let config = ProxyConfig {
         target: format!("http://127.0.0.1:{}", backend.port),
         cors,
     };
-    let proxy = Proxy::new(config, store.clone()).expect("proxy");
+    let proxy = Proxy::new(config, store.clone(), scenarios.clone()).expect("proxy");
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
     let port = listener.local_addr().expect("addr").port();
     tokio::spawn(proxy.serve(listener));
-    (port, store)
+    (port, store, scenarios)
 }
 
 #[tokio::test]
@@ -208,5 +220,138 @@ async fn offers_backend_only_gzip_when_browser_accepts_encodings() {
         reply.body.contains("accept-encoding: gzip\r\n"),
         "{}",
         reply.body
+    );
+}
+
+fn scenarios(match_text: &str, action: Action) -> ScenarioSet {
+    let endpoint = match_text.parse().expect("endpoint");
+    ScenarioSet::new(vec![Scenario { endpoint, action }])
+}
+
+#[tokio::test]
+async fn status_scenario_skips_the_backend_and_is_labelled() {
+    let backend = backend("").await;
+    let set = scenarios("GET /api/users/:id", Action::Status(500));
+    let (port, store, _) = start_with(&backend, true, set).await;
+
+    let reply = send(port, "GET", "/api/users/7", "", "")
+        .await
+        .expect("reply");
+
+    assert_eq!(reply.status, 500);
+    assert!(
+        reply.body.contains("Internal Server Error"),
+        "{}",
+        reply.body
+    );
+    assert_eq!(backend.hit_count(), 0);
+    assert_eq!(finished(&store).await.scenario.as_deref(), Some("500"));
+
+    let other = send(port, "GET", "/api/users", "", "")
+        .await
+        .expect("reply");
+    assert_eq!(other.status, 200);
+}
+
+#[tokio::test]
+async fn status_401_says_the_token_expired() {
+    let backend = backend("").await;
+    let set = scenarios("GET /me", Action::Status(401));
+    let (port, _, _) = start_with(&backend, true, set).await;
+    let reply = send(port, "GET", "/me", "", "").await.expect("reply");
+    assert_eq!(reply.status, 401);
+    assert!(reply.body.contains("token_expired"), "{}", reply.body);
+}
+
+#[tokio::test]
+async fn scenario_responses_still_carry_cors_headers() {
+    let backend = backend("").await;
+    let set = scenarios("GET /a", Action::Status(500));
+    let (port, _, _) = start_with(&backend, true, set).await;
+    let extra = "Origin: http://localhost:5173\r\n";
+    let reply = send(port, "GET", "/a", extra, "").await.expect("reply");
+    assert!(reply.header("access-control-allow-origin").is_some());
+}
+
+#[tokio::test]
+async fn preflight_passes_even_when_the_endpoint_is_broken() {
+    let backend = backend("").await;
+    let set = scenarios("OPTIONS /a", Action::Offline);
+    let (port, _, _) = start_with(&backend, true, set).await;
+    let extra = "Origin: http://localhost:5173\r\nAccess-Control-Request-Method: GET\r\n";
+    let reply = send(port, "OPTIONS", "/a", extra, "").await.expect("reply");
+    assert_eq!(reply.status, 204);
+}
+
+#[tokio::test]
+async fn delay_scenario_holds_the_response_then_forwards() {
+    let backend = backend("").await;
+    let set = scenarios("GET /slow", Action::Delay(Duration::from_millis(200)));
+    let (port, _, _) = start_with(&backend, true, set).await;
+
+    let started = std::time::Instant::now();
+    let reply = send(port, "GET", "/slow", "", "").await.expect("reply");
+
+    assert!(started.elapsed() >= Duration::from_millis(200));
+    assert_eq!(reply.status, 200);
+    assert_eq!(backend.hit_count(), 1);
+}
+
+#[tokio::test]
+async fn offline_scenario_closes_the_socket_without_a_response() {
+    let backend = backend("").await;
+    let set = scenarios("GET /down", Action::Offline);
+    let (port, store, _) = start_with(&backend, true, set).await;
+
+    assert!(send(port, "GET", "/down", "", "").await.is_none());
+
+    assert_eq!(backend.hit_count(), 0);
+    let entry = finished(&store).await;
+    assert_eq!(
+        entry.outcome,
+        Outcome::Failed("connection dropped by scenario".into())
+    );
+}
+
+#[tokio::test]
+async fn empty_scenario_follows_the_shape_of_the_real_response() {
+    let backend = support::json_backend("[1,2]").await;
+    let (port, store, handle) = start_with(&backend, true, ScenarioSet::default()).await;
+    let action = || Scenario {
+        endpoint: "GET /list".parse().expect("endpoint"),
+        action: Action::Empty,
+    };
+
+    send(port, "GET", "/list", "", "").await.expect("reply");
+    finished(&store).await;
+    handle.update(|set| set.toggle(action()));
+
+    let reply = send(port, "GET", "/list", "", "").await.expect("reply");
+    assert_eq!((reply.status, reply.body.as_str()), (200, "[]"));
+
+    store.clear();
+    let reply = send(port, "GET", "/list", "", "").await.expect("reply");
+    assert_eq!((reply.status, reply.body.as_str()), (204, ""));
+}
+
+#[tokio::test]
+async fn scenarios_take_effect_without_a_restart() {
+    let backend = backend("").await;
+    let (port, _, handle) = start_with(&backend, true, ScenarioSet::default()).await;
+    let action = || Scenario {
+        endpoint: "GET /a".parse().expect("endpoint"),
+        action: Action::Status(404),
+    };
+
+    handle.update(|set| set.toggle(action()));
+    assert_eq!(
+        send(port, "GET", "/a", "", "").await.expect("reply").status,
+        404
+    );
+
+    handle.update(|set| set.toggle(action()));
+    assert_eq!(
+        send(port, "GET", "/a", "", "").await.expect("reply").status,
+        200
     );
 }

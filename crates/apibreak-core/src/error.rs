@@ -14,6 +14,8 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+    #[error("invalid scenario: {0}")]
+    InvalidScenario(String),
     #[error("accepting connection failed: {0}")]
     Accept(#[source] std::io::Error),
 }

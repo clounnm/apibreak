@@ -29,10 +29,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_header(frame, app, header);
     draw_list(frame, app, list);
     draw_details(frame, app, details);
-    frame.render_widget(
-        Line::styled("no active scenarios", style::muted()),
-        scenarios,
-    );
+    frame.render_widget(scenario_line(app), scenarios);
     draw_footer(frame, app, footer);
     if app.mode == Mode::Help {
         draw_help(frame);
@@ -48,6 +45,14 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled("  paused", style::warning()));
     }
     frame.render_widget(Line::from(spans), area);
+}
+
+fn scenario_line(app: &App) -> Line<'static> {
+    let summary = app.active.summary();
+    if summary.is_empty() {
+        return Line::styled("no active scenarios", style::muted());
+    }
+    Line::styled(format!("⚠ {}", summary.join(" · ")), style::warning())
 }
 
 fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
@@ -250,7 +255,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             ));
         }
         spans.push(Span::styled(
-            "j/k move  / filter  Tab pane  p pause  c clear  ? help  q quit",
+            "5/4/n/e/d/o break  x fix  / filter  Tab pane  p pause  ? help  q quit",
             style::muted(),
         ));
         Line::from(spans)
@@ -263,6 +268,13 @@ const HELP: &[(&str, &str)] = &[
     ("g / G", "first / last"),
     ("/", "filter by path"),
     ("Tab", "switch pane"),
+    ("5", "return 500"),
+    ("4", "return 401 (token expired)"),
+    ("n", "return 404"),
+    ("e", "empty response, [] for arrays"),
+    ("d", "delay the response"),
+    ("o", "offline: drop the connection"),
+    ("x", "remove scenarios from endpoint"),
     ("c", "clear list"),
     ("p", "pause recording"),
     ("q", "quit"),
@@ -300,12 +312,23 @@ mod tests {
     use std::sync::Arc;
 
     use apibreak_core::store::{NewExchange, ResponseRecord};
-    use apibreak_core::Store;
+    use apibreak_core::{ScenarioHandle, ScenarioSet, Store};
     use bytes::Bytes;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
+    use super::super::keymap::{Action, Break};
     use super::*;
+
+    fn new_app(store: Arc<Store>, title: &str) -> App {
+        let scenarios = ScenarioHandle::new(ScenarioSet::default());
+        App::new(
+            store,
+            scenarios,
+            std::time::Duration::from_secs(3),
+            title.into(),
+        )
+    }
 
     fn app() -> App {
         let store = Arc::new(Store::new(8));
@@ -328,7 +351,7 @@ mod tests {
             Outcome::Response(response),
             std::time::Duration::from_millis(12),
         );
-        let mut app = App::new(store, ":4000 -> http://backend".into());
+        let mut app = new_app(store, ":4000 -> http://backend");
         while let Ok(event) = events.try_recv() {
             app.apply_event(event);
         }
@@ -358,7 +381,7 @@ mod tests {
 
     #[test]
     fn survives_tiny_terminals_and_empty_state() {
-        let mut empty = App::new(Arc::new(Store::new(1)), String::new());
+        let mut empty = new_app(Arc::new(Store::new(1)), "");
         for (width, height) in [(1, 1), (10, 3), (20, 5), (80, 24), (200, 60)] {
             render(&mut app(), width, height);
             render(&mut empty, width, height);
@@ -374,6 +397,16 @@ mod tests {
         let narrow = list_row(&app().visible()[0].clone(), 38).to_string();
         assert!(wide.len() > narrow.len());
         assert!(wide.contains(':') && !narrow.contains(':') || narrow.contains("/api"));
+    }
+
+    #[test]
+    fn status_line_lists_active_scenarios() {
+        let mut app = app();
+        assert!(render(&mut app, 80, 24).contains("no active scenarios"));
+        app.handle(Action::Break(Break::Status500));
+        app.active = app.scenarios_for_test();
+        let screen = render(&mut app, 80, 24);
+        assert!(screen.contains("⚠ GET /api/users → 500"), "{screen}");
     }
 
     #[test]

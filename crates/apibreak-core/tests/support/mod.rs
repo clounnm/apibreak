@@ -85,6 +85,30 @@ pub async fn backend(headers: &'static str) -> Backend {
     Backend { port, hits }
 }
 
+/// Starts a backend answering every request with `body` as JSON.
+pub async fn json_backend(body: &'static str) -> Backend {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = hits.clone();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let counter = counter.clone();
+            tokio::spawn(async move {
+                read_request(&mut stream).await;
+                counter.fetch_add(1, Ordering::SeqCst);
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(reply.as_bytes()).await;
+            });
+        }
+    });
+    Backend { port, hits }
+}
+
 async fn read_request(stream: &mut TcpStream) -> String {
     let mut raw = Vec::new();
     let mut chunk = [0u8; 4096];
