@@ -61,6 +61,8 @@ pub struct App {
     pub detail_max_scroll: u16,
     pub should_quit: bool,
     pub message: Option<Message>,
+    /// What is wrong with `scenarios.yaml` right now, if anything.
+    pub config_error: Option<String>,
     /// A mock waiting to be opened in the editor by the event loop.
     pub pending_edit: Option<String>,
     cache: Option<DetailCache>,
@@ -92,6 +94,7 @@ impl App {
             detail_max_scroll: 0,
             should_quit: false,
             message: None,
+            config_error: None,
             pending_edit: None,
             cache: None,
         }

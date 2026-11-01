@@ -30,28 +30,51 @@ use app::App;
 
 const TICK: Duration = Duration::from_millis(40);
 
-/// Runs the UI until the user quits. `title` is shown in the header.
-pub fn run(
-    store: Arc<Store>,
-    scenarios: ScenarioHandle,
-    mocks: MockStore,
-    default_delay: Duration,
-    title: String,
-) -> Result<()> {
+/// Everything the UI needs from `main`.
+pub struct Setup {
+    pub store: Arc<Store>,
+    pub scenarios: ScenarioHandle,
+    pub config_status: watch::Receiver<Option<String>>,
+    pub mocks: MockStore,
+    pub default_delay: Duration,
+    /// Shown in the header.
+    pub title: String,
+}
+
+/// Runs the UI until the user quits.
+pub fn run(setup: Setup) -> Result<()> {
+    let Setup {
+        store,
+        scenarios,
+        config_status,
+        mocks,
+        default_delay,
+        title,
+    } = setup;
     // Installs a panic hook that leaves raw mode and the alternate screen.
     let mut terminal = ratatui::try_init().context("cannot set up the terminal")?;
-    let mut watcher = scenarios.subscribe();
+    let watcher = scenarios.subscribe();
     let app = App::new(store.clone(), scenarios, mocks, default_delay, title);
-    let result = event_loop(&mut terminal, app, &store, &mut watcher);
+    let channels = Channels {
+        scenarios: watcher,
+        config_status,
+    };
+    let result = event_loop(&mut terminal, app, &store, channels);
     let restored = ratatui::try_restore().context("cannot restore the terminal");
     result.and(restored)
+}
+
+/// Followed by the event loop alongside the store's events.
+struct Channels {
+    scenarios: watch::Receiver<Arc<ScenarioSet>>,
+    config_status: watch::Receiver<Option<String>>,
 }
 
 fn event_loop(
     terminal: &mut DefaultTerminal,
     mut app: App,
     store: &Store,
-    scenarios: &mut watch::Receiver<Arc<ScenarioSet>>,
+    mut channels: Channels,
 ) -> Result<()> {
     let mut events = store.subscribe();
     app.resync(store.snapshot());
@@ -65,8 +88,12 @@ fn event_loop(
             }
             dirty = true;
         }
-        if scenarios.has_changed().unwrap_or(false) {
-            app.active = scenarios.borrow_and_update().clone();
+        if channels.scenarios.has_changed().unwrap_or(false) {
+            app.active = channels.scenarios.borrow_and_update().clone();
+            dirty = true;
+        }
+        if channels.config_status.has_changed().unwrap_or(false) {
+            app.config_error = channels.config_status.borrow_and_update().clone();
             dirty = true;
         }
         if dirty {

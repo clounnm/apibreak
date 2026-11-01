@@ -48,6 +48,10 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn scenario_line(app: &App) -> Line<'static> {
+    if let Some(error) = &app.config_error {
+        let first_line = error.lines().next().unwrap_or_default();
+        return Line::styled(first_line.to_owned(), style::error());
+    }
     let summary = app.active.summary();
     if summary.is_empty() {
         return Line::styled("no active scenarios", style::muted());

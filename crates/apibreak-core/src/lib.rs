@@ -12,5 +12,5 @@ pub mod store;
 pub use error::{Error, Result};
 pub use mock::{Mock, MockStore};
 pub use proxy::{Proxy, ProxyConfig};
-pub use scenario::{Action, Endpoint, Scenario, ScenarioHandle, ScenarioSet};
+pub use scenario::{Action, Config, Endpoint, Scenario, ScenarioHandle, ScenarioSet};
 pub use store::{Exchange, Outcome, Store, StoreEvent};

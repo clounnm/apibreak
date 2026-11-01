@@ -109,6 +109,32 @@ pub async fn json_backend(body: &'static str) -> Backend {
     Backend { port, hits }
 }
 
+/// Starts a backend that sends `first`, then keeps the response open until
+/// the client goes away, as server-sent events do.
+pub async fn stalling_backend(first: &'static str) -> Backend {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                read_request(&mut stream).await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                     Transfer-Encoding: chunked\r\n\r\n{:x}\r\n{first}\r\n",
+                    first.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let mut rest = Vec::new();
+                let _ = stream.read_to_end(&mut rest).await;
+            });
+        }
+    });
+    Backend {
+        port,
+        hits: Default::default(),
+    }
+}
+
 async fn read_request(stream: &mut TcpStream) -> String {
     let mut raw = Vec::new();
     let mut chunk = [0u8; 4096];

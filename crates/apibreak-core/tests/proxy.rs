@@ -9,7 +9,8 @@ use apibreak_core::{
     ScenarioSet, Store,
 };
 use support::{backend, send, Backend};
-use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
 async fn start_proxy(backend: &Backend, cors: bool) -> u16 {
     start_recording(backend, cors).await.0
@@ -423,4 +424,39 @@ async fn missing_mock_is_a_visible_error() {
     assert_eq!(reply.status, 502);
     assert!(reply.body.contains("mocks/none.json"), "{}", reply.body);
     assert_eq!(backend.hit_count(), 0);
+}
+
+#[tokio::test]
+async fn streams_responses_as_they_arrive_and_records_cut_ones() {
+    let backend = support::stalling_backend("data: one").await;
+    let (port, store) = start_recording(&backend, true).await;
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect");
+    let request = format!("GET /events HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.expect("write");
+
+    let mut seen = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while !String::from_utf8_lossy(&seen).contains("data: one") {
+        let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut chunk))
+            .await
+            .expect("first event must arrive while the backend stalls")
+            .expect("read");
+        assert_ne!(read, 0, "connection closed early");
+        seen.extend_from_slice(&chunk[..read]);
+    }
+    assert_eq!(store.snapshot()[0].outcome, Outcome::Pending);
+
+    drop(stream);
+    let entry = finished(&store).await;
+    let Outcome::Response(response) = &entry.outcome else {
+        panic!("expected response, got {:?}", entry.outcome);
+    };
+    assert_eq!(&response.body.bytes[..], b"data: one");
+    assert!(
+        response.body.truncated,
+        "a cut stream must not look complete"
+    );
 }

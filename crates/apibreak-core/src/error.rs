@@ -16,6 +16,10 @@ pub enum Error {
     },
     #[error("invalid scenario: {0}")]
     InvalidScenario(String),
+    #[error("invalid config {}: {message}", path.display())]
+    InvalidConfig { path: PathBuf, message: String },
+    #[error("cannot watch config: {0}")]
+    Watch(#[from] notify::Error),
     #[error("cannot record mock: {0}")]
     CannotRecord(String),
     #[error("invalid mock {file}: {source}")]

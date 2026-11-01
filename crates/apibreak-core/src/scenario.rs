@@ -1,15 +1,21 @@
-//! Failure scenarios: the model, and matching them against requests.
+//! Failure scenarios: the model, matching them against requests, and keeping
+//! them in sync with `scenarios.yaml`.
 
 use std::collections::HashSet;
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use notify::{RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
-use crate::error::Error;
+use crate::error::{Error, Result};
+
+/// Lets editors finish their write-and-rename before the file is read.
+const RELOAD_DEBOUNCE: Duration = Duration::from_millis(100);
 
 /// Delay applied by a new delay scenario unless configured otherwise.
 pub const DEFAULT_DELAY: Duration = Duration::from_secs(3);
@@ -71,7 +77,7 @@ impl fmt::Display for Endpoint {
 impl FromStr for Endpoint {
     type Err = Error;
 
-    fn from_str(text: &str) -> Result<Self, Error> {
+    fn from_str(text: &str) -> Result<Self> {
         let invalid = || Error::InvalidScenario(format!("bad match `{text}`, want `GET /path`"));
         let (method, path) = text
             .trim()
@@ -137,12 +143,21 @@ struct RawScenario {
 impl TryFrom<RawScenario> for Scenario {
     type Error = Error;
 
-    fn try_from(raw: RawScenario) -> Result<Self, Error> {
+    fn try_from(raw: RawScenario) -> Result<Self> {
         let endpoint = raw.matches.parse()?;
         let missing =
             |field: &str| Error::InvalidScenario(format!("`{}` needs `{field}`", raw.matches));
         let action = match raw.action.as_str() {
-            "status" => Action::Status(raw.status.ok_or_else(|| missing("status"))?),
+            "status" => {
+                let status = raw.status.ok_or_else(|| missing("status"))?;
+                if !(100..=599).contains(&status) {
+                    return Err(Error::InvalidScenario(format!(
+                        "`{}` has invalid status {status}",
+                        raw.matches
+                    )));
+                }
+                Action::Status(status)
+            }
             "empty" => Action::Empty,
             "delay" => {
                 let delay = raw.delay.as_deref().ok_or_else(|| missing("delay"))?;
@@ -192,7 +207,7 @@ impl From<Scenario> for RawScenario {
 }
 
 /// Parses `500ms`, `3s`, `1.5s` or `2m`.
-pub fn parse_duration(text: &str) -> Result<Duration, Error> {
+pub fn parse_duration(text: &str) -> Result<Duration> {
     let invalid = || Error::InvalidScenario(format!("bad duration `{text}`, want 500ms, 3s or 2m"));
     let text = text.trim();
     let (number, scale) = if let Some(number) = text.strip_suffix("ms") {
@@ -386,6 +401,198 @@ impl ScenarioHandle {
     }
 }
 
+/// The contents of `scenarios.yaml`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Config {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// Delay for the `d` key, such as `3s`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_delay: Option<String>,
+    #[serde(default)]
+    pub scenarios: ScenarioSet,
+}
+
+impl Config {
+    /// Reads the file. `None` means it does not exist.
+    pub fn load(path: &Path) -> Result<Option<Self>> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(Error::Io {
+                    action: "reading",
+                    path: path.to_owned(),
+                    source,
+                })
+            }
+        };
+        if !text.lines().any(has_content) {
+            return Ok(Some(Self::default()));
+        }
+        serde_saphyr::from_str(&text)
+            .map(Some)
+            .map_err(|error| Error::InvalidConfig {
+                path: path.to_owned(),
+                message: error.to_string(),
+            })
+    }
+
+    /// Replaces the file in one step, so a reader never sees half of it.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let text = serde_saphyr::to_string(self).map_err(|error| Error::InvalidConfig {
+            path: path.to_owned(),
+            message: error.to_string(),
+        })?;
+        let temporary = path.with_extension("yaml.tmp");
+        let io_error = |source| Error::Io {
+            action: "writing",
+            path: path.to_owned(),
+            source,
+        };
+        std::fs::write(&temporary, text).map_err(io_error)?;
+        std::fs::rename(&temporary, path).map_err(io_error)
+    }
+}
+
+fn has_content(line: &str) -> bool {
+    let line = line.trim();
+    !line.is_empty() && !line.starts_with('#')
+}
+
+/// Keeps `handle` and the file at `path` in step until the runtime stops:
+/// edits to the file reach the proxy, and changes made through `handle` are
+/// saved. `config` is what the file holds now; its fields other than the
+/// scenarios are preserved when saving. Call from within a tokio runtime.
+///
+/// The returned channel carries the current problem with the file, if any.
+pub fn sync_with_file(
+    handle: ScenarioHandle,
+    path: PathBuf,
+    config: Config,
+) -> Result<watch::Receiver<Option<String>>> {
+    let (changes, file_events) = mpsc::unbounded_channel();
+    let name = path.file_name().map(ToOwned::to_owned);
+    let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        let relevant = event.is_ok_and(|event| {
+            event
+                .paths
+                .iter()
+                .any(|changed| changed.file_name() == name.as_deref())
+        });
+        if relevant {
+            // Fails only once the sync task is gone.
+            let _ = changes.send(());
+        }
+    })?;
+    // The directory, not the file: editors often replace the file by renaming.
+    let directory = path.parent().unwrap_or(Path::new("."));
+    watcher.watch(directory, RecursiveMode::NonRecursive)?;
+
+    let (status, status_receiver) = watch::channel(None);
+    let sync = FileSync {
+        handle,
+        path,
+        config,
+        status,
+        file_broken: false,
+    };
+    tokio::spawn(sync.run(file_events, watcher));
+    Ok(status_receiver)
+}
+
+struct FileSync {
+    handle: ScenarioHandle,
+    path: PathBuf,
+    /// What is believed to be on disk.
+    config: Config,
+    status: watch::Sender<Option<String>>,
+    file_broken: bool,
+}
+
+impl FileSync {
+    /// `_watcher` is held here because dropping it stops the events.
+    async fn run(
+        mut self,
+        mut file_events: mpsc::UnboundedReceiver<()>,
+        _watcher: notify::RecommendedWatcher,
+    ) {
+        let mut scenarios = self.handle.subscribe();
+        loop {
+            tokio::select! {
+                event = file_events.recv() => {
+                    if event.is_none() {
+                        return;
+                    }
+                    tokio::time::sleep(RELOAD_DEBOUNCE).await;
+                    while file_events.try_recv().is_ok() {}
+                    self.reload();
+                }
+                changed = scenarios.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    let current = scenarios.borrow_and_update().clone();
+                    self.save(&current);
+                }
+            }
+        }
+    }
+
+    fn reload(&mut self) {
+        match Config::load(&self.path) {
+            Ok(Some(config)) => {
+                self.file_broken = false;
+                self.report(None);
+                // Events also fire for our own saves. Applying an unchanged
+                // file could undo a change the handle has just made.
+                if config == self.config {
+                    return;
+                }
+                let scenarios = config.scenarios.clone();
+                self.config = config;
+                self.handle.update(|set| *set = scenarios);
+            }
+            // Deleting the file is not a request to drop what is active. The
+            // next change made through the handle writes it back.
+            Ok(None) => {}
+            Err(error) => {
+                self.file_broken = true;
+                self.report(Some(error.to_string()));
+            }
+        }
+    }
+
+    fn save(&mut self, current: &ScenarioSet) {
+        if *current == self.config.scenarios {
+            return;
+        }
+        self.config.scenarios = current.clone();
+        // Saving now would overwrite whatever the user is halfway through.
+        if self.file_broken {
+            return;
+        }
+        let problem = self
+            .config
+            .save(&self.path)
+            .err()
+            .map(|error| error.to_string());
+        self.report(problem);
+    }
+
+    /// Passes on a change of status. A file saved repeatedly in a broken
+    /// state stays one problem rather than a stream of identical ones.
+    fn report(&self, problem: Option<String>) {
+        self.status.send_if_modified(|status| {
+            let changed = *status != problem;
+            *status = problem;
+            changed
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,5 +736,159 @@ mod tests {
         assert!(receiver.has_changed().expect("open"));
         receiver.mark_unchanged();
         assert_eq!(handle.current().iter().count(), 1);
+    }
+
+    const EXAMPLE: &str = r#"
+target: https://api.example.com
+port: 4000
+scenarios:
+  - match: "GET /api/users"
+    action: status
+    status: 500
+  - match: "POST /api/login"
+    action: delay
+    delay: 3s
+  - match: "GET /api/users/:id"
+    action: mock
+    file: mocks/GET_api_users_id.json
+  - match: "GET /api/feed"
+    action: empty
+  - match: "GET /api/ping"
+    action: offline
+"#;
+
+    fn write_example(directory: &Path) -> PathBuf {
+        let path = directory.join("scenarios.yaml");
+        std::fs::write(&path, EXAMPLE).expect("write");
+        path
+    }
+
+    #[test]
+    fn loads_the_documented_example() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config = Config::load(&write_example(directory.path()))
+            .expect("load")
+            .expect("exists");
+        assert_eq!(config.target.as_deref(), Some("https://api.example.com"));
+        assert_eq!(config.port, Some(4000));
+        assert_eq!(
+            config.scenarios.summary(),
+            [
+                "GET /api/users → 500",
+                "POST /api/login → delay 3s",
+                "GET /api/users/:id → mock",
+                "GET /api/feed → empty",
+                "GET /api/ping → offline",
+            ]
+        );
+    }
+
+    #[test]
+    fn config_round_trips_through_the_file() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = write_example(directory.path());
+        let config = Config::load(&path).expect("load").expect("exists");
+
+        config.save(&path).expect("save");
+
+        assert_eq!(Config::load(&path).expect("load"), Some(config));
+    }
+
+    #[test]
+    fn missing_and_comment_only_files_are_fine() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("scenarios.yaml");
+        assert_eq!(Config::load(&path).expect("load"), None);
+        std::fs::write(&path, "# nothing yet\n\n").expect("write");
+        assert_eq!(Config::load(&path).expect("load"), Some(Config::default()));
+    }
+
+    #[test]
+    fn bad_files_name_the_problem() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("scenarios.yaml");
+        for (text, needle) in [
+            (
+                "scenarios:\n  - match: \"GET /a\"\n    action: explode\n",
+                "explode",
+            ),
+            (
+                "scenarios:\n  - match: \"GET /a\"\n    action: status\n",
+                "status",
+            ),
+            (
+                "scenarios:\n  - match: \"GET /a\"\n    action: status\n    status: 9\n",
+                "9",
+            ),
+            (
+                "scenarios:\n  - match: \"nope\"\n    action: empty\n",
+                "nope",
+            ),
+        ] {
+            std::fs::write(&path, text).expect("write");
+            let message = Config::load(&path).expect_err(text).to_string();
+            assert!(message.contains(needle), "{message}");
+        }
+    }
+
+    async fn wait_until(what: &str, condition: impl Fn() -> bool) {
+        for _ in 0..300 {
+            if condition() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    #[tokio::test]
+    async fn hot_reload_and_saving_both_ways() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = write_example(directory.path());
+        let config = Config::load(&path).expect("load").expect("exists");
+        let handle = ScenarioHandle::new(config.scenarios.clone());
+        let status = sync_with_file(handle.clone(), path.clone(), config).expect("sync");
+
+        // Hand edit reaches the proxy.
+        std::fs::write(
+            &path,
+            "target: https://kept.example\nscenarios:\n  - match: \"GET /new\"\n    action: offline\n",
+        )
+        .expect("write");
+        wait_until("reload", || {
+            handle.current().summary() == ["GET /new → offline"]
+        })
+        .await;
+
+        // A broken edit keeps the last good scenarios and reports the error.
+        std::fs::write(&path, "scenarios: [").expect("write");
+        wait_until("error", || status.borrow().is_some()).await;
+        assert_eq!(handle.current().iter().count(), 1);
+
+        // While broken, changes must not clobber the file being edited.
+        handle.update(|set| set.toggle(scenario("GET /ui", Action::Status(500))));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "scenarios: ["
+        );
+
+        // Fixing the file wins over the unsaved change.
+        std::fs::write(
+            &path,
+            "target: https://kept.example\nscenarios:\n  - match: \"GET /fixed\"\n    action: empty\n",
+        )
+        .expect("write");
+        wait_until("recovery", || status.borrow().is_none()).await;
+        wait_until("fixed", || {
+            handle.current().summary() == ["GET /fixed → empty"]
+        })
+        .await;
+
+        // A change made through the handle lands in the file, target intact.
+        handle.update(|set| set.toggle(scenario("POST /b", Action::Status(401))));
+        let on_disk = || Config::load(&path).ok().flatten().unwrap_or_default();
+        wait_until("save", || on_disk().scenarios.iter().count() == 2).await;
+        assert_eq!(on_disk().target.as_deref(), Some("https://kept.example"));
     }
 }
