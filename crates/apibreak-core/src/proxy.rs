@@ -7,12 +7,15 @@
 //! features off, bodies reach the browser exactly as the backend sent them.
 
 use std::convert::Infallible;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::task::{ready, Context, Poll};
+use std::time::{Duration, Instant};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use http::{Request, Response, StatusCode};
+use http_body::{Body, Frame};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
@@ -23,6 +26,7 @@ use url::Url;
 
 use crate::cors;
 use crate::error::{Error, Result};
+use crate::store::{Captured, Headers, NewExchange, Outcome, ResponseRecord, Store, CAPTURE_LIMIT};
 
 /// Request bodies are buffered before forwarding, so they need a ceiling.
 const MAX_REQUEST_BODY: usize = 256 * 1024 * 1024;
@@ -51,6 +55,7 @@ struct Inner {
     base: String,
     cors: bool,
     client: reqwest::Client,
+    store: Arc<Store>,
 }
 
 /// Makes hyper close the connection without writing a response.
@@ -59,7 +64,7 @@ struct Inner {
 struct DropConnection;
 
 impl Proxy {
-    pub fn new(config: ProxyConfig) -> Result<Self> {
+    pub fn new(config: ProxyConfig, store: Arc<Store>) -> Result<Self> {
         let url =
             Url::parse(&config.target).map_err(|_| Error::InvalidTarget(config.target.clone()))?;
         if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
@@ -78,6 +83,7 @@ impl Proxy {
                 base,
                 cors: config.cors,
                 client,
+                store,
             }),
         })
     }
@@ -116,29 +122,36 @@ impl Proxy {
             .flatten();
 
         let (parts, body) = request.into_parts();
+        let body = Limited::new(body, MAX_REQUEST_BODY).collect().await;
+        let too_large = body.is_err();
+        let body = body.map(|body| body.to_bytes()).unwrap_or_default();
+
+        let started = Instant::now();
+        let id = self.inner.store.begin(NewExchange {
+            method: parts.method.to_string(),
+            path: parts.uri.path().to_owned(),
+            uri: path_and_query(&parts.uri).to_owned(),
+            request_headers: header_list(&parts.headers),
+            request_body: Captured::new(body.clone()),
+            scenario: None,
+        });
+        let recording = Recording::new(self.inner.store.clone(), id, started);
+
+        if too_large {
+            let response = error_response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
+            return Ok(finish(response, recording, origin.as_ref()));
+        }
         if let Some(origin) = &origin {
             if cors::is_preflight(&parts.method, &parts.headers) {
                 let headers = cors::preflight_headers(&parts.headers, origin);
-                return Ok(respond(StatusCode::NO_CONTENT, headers, Bytes::new()));
+                let response = respond(StatusCode::NO_CONTENT, headers, Bytes::new());
+                return Ok(finish(response, recording, None));
             }
         }
-
-        let mut response = match Limited::new(body, MAX_REQUEST_BODY).collect().await {
-            Ok(collected) => {
-                self.forward(
-                    parts.method,
-                    &parts.uri,
-                    &parts.headers,
-                    collected.to_bytes(),
-                )
-                .await
-            }
-            Err(_) => error_response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
-        };
-        if let Some(origin) = &origin {
-            cors::apply(response.headers_mut(), origin);
-        }
-        Ok(response)
+        let response = self
+            .forward(parts.method, &parts.uri, &parts.headers, body)
+            .await;
+        Ok(finish(response, recording, origin.as_ref()))
     }
 
     async fn forward(
@@ -148,11 +161,15 @@ impl Proxy {
         headers: &HeaderMap,
         body: Bytes,
     ) -> Response<ProxyBody> {
-        let path = uri.path_and_query().map_or("/", |value| value.as_str());
-        let url = format!("{}{path}", self.inner.base);
+        let url = format!("{}{}", self.inner.base, path_and_query(uri));
         let mut upstream_headers = strip_hop_by_hop(headers);
         // reqwest derives Host from the URL, which is the rewrite we want.
         upstream_headers.remove(header::HOST);
+        // gzip is the one encoding the details panel can read back, so don't
+        // let the backend pick brotli or zstd when the browser offers them.
+        if upstream_headers.contains_key(header::ACCEPT_ENCODING) {
+            upstream_headers.insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
+        }
 
         let result = self
             .inner
@@ -193,6 +210,129 @@ impl Proxy {
             headers.insert(header::LOCATION, value);
         }
     }
+}
+
+/// Applies CORS and wires the body up so the exchange is recorded as it ends.
+fn finish(
+    mut response: Response<ProxyBody>,
+    mut recording: Recording,
+    origin: Option<&HeaderValue>,
+) -> Response<ProxyBody> {
+    if let Some(origin) = origin {
+        cors::apply(response.headers_mut(), origin);
+    }
+    recording.response = Some((response.status().as_u16(), header_list(response.headers())));
+    response.map(|inner| UnsyncBoxBody::new(RecordedBody { inner, recording }))
+}
+
+/// Tracks an exchange until it is over. Finishing in `Drop` covers every way
+/// out, including a client that disconnects while a response is streaming.
+struct Recording {
+    store: Arc<Store>,
+    id: u64,
+    started: Instant,
+    response: Option<(u16, Headers)>,
+    captured: BytesMut,
+    truncated: bool,
+    ended: bool,
+}
+
+impl Recording {
+    fn new(store: Arc<Store>, id: u64, started: Instant) -> Self {
+        Self {
+            store,
+            id,
+            started,
+            response: None,
+            captured: BytesMut::new(),
+            truncated: false,
+            ended: false,
+        }
+    }
+
+    fn capture(&mut self, data: &[u8]) {
+        let room = CAPTURE_LIMIT.saturating_sub(self.captured.len());
+        self.truncated |= data.len() > room;
+        self.captured
+            .extend_from_slice(&data[..data.len().min(room)]);
+    }
+}
+
+impl Drop for Recording {
+    fn drop(&mut self) {
+        let outcome = match self.response.take() {
+            Some((status, headers)) => Outcome::Response(ResponseRecord {
+                status,
+                headers,
+                body: Captured {
+                    bytes: self.captured.split().freeze(),
+                    truncated: self.truncated || !self.ended,
+                },
+            }),
+            None => Outcome::Failed("client disconnected".to_owned()),
+        };
+        self.store.finish(self.id, outcome, self.started.elapsed());
+    }
+}
+
+/// Passes a response body through, copying what it sees into a [`Recording`].
+/// Streaming keeps long-lived responses such as server-sent events working.
+struct RecordedBody {
+    inner: ProxyBody,
+    recording: Recording,
+}
+
+impl Drop for RecordedBody {
+    fn drop(&mut self) {
+        // hyper stops polling at the content length, so the end of the stream
+        // is not always observed as a final `None` frame.
+        self.recording.ended |= self.inner.is_end_stream();
+    }
+}
+
+impl Body for RecordedBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<Frame<Bytes>, BoxError>>> {
+        let this = self.get_mut();
+        let frame = ready!(Pin::new(&mut this.inner).poll_frame(cx));
+        match &frame {
+            Some(Ok(frame)) => {
+                if let Some(data) = frame.data_ref() {
+                    this.recording.capture(data);
+                }
+            }
+            Some(Err(_)) => {}
+            None => this.recording.ended = true,
+        }
+        Poll::Ready(frame)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+fn path_and_query(uri: &http::Uri) -> &str {
+    uri.path_and_query().map_or("/", |value| value.as_str())
+}
+
+fn header_list(headers: &HeaderMap) -> Headers {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            let value = String::from_utf8_lossy(value.as_bytes()).into_owned();
+            (name.to_string(), value)
+        })
+        .collect()
 }
 
 fn is_transient(error: &std::io::Error) -> bool {
@@ -289,10 +429,13 @@ mod tests {
 
     #[test]
     fn rewrites_only_redirects_into_the_target() {
-        let proxy = Proxy::new(ProxyConfig {
-            target: "https://api.example.com/v1/".into(),
-            cors: true,
-        })
+        let proxy = Proxy::new(
+            ProxyConfig {
+                target: "https://api.example.com/v1/".into(),
+                cors: true,
+            },
+            Arc::new(Store::new(1)),
+        )
         .expect("proxy");
         for (location, expected) in [
             ("https://api.example.com/v1/users?a=1", "/users?a=1"),
@@ -321,7 +464,8 @@ mod tests {
                 target: target.into(),
                 cors: true,
             };
-            assert!(matches!(Proxy::new(config), Err(Error::InvalidTarget(_))));
+            let result = Proxy::new(config, Arc::new(Store::new(1)));
+            assert!(matches!(result, Err(Error::InvalidTarget(_))));
         }
     }
 }

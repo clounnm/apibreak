@@ -1,7 +1,11 @@
+mod tui;
+
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use apibreak_core::{Proxy, ProxyConfig};
+use apibreak_core::store::DEFAULT_CAPACITY;
+use apibreak_core::{Proxy, ProxyConfig, Store};
 use clap::{ArgAction, Parser};
 use tokio::net::TcpListener;
 
@@ -21,6 +25,9 @@ struct Cli {
     #[arg(long, default_value_t = true, action = ArgAction::Set, num_args = 0..=1,
           default_missing_value = "true", require_equals = true)]
     cors: bool,
+    /// How many requests to keep in memory
+    #[arg(long, default_value_t = DEFAULT_CAPACITY)]
+    history: usize,
 }
 
 /// Binds IPv4 loopback, and IPv6 too because `localhost` may resolve to `::1`.
@@ -36,26 +43,23 @@ async fn bind(port: u16) -> Result<Vec<TcpListener>> {
     Ok(listeners)
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
     let Some(target) = cli.target else {
         bail!("no backend set: pass --target https://api.example.com");
     };
     let port = cli.port.unwrap_or(DEFAULT_PORT);
-    let proxy = Proxy::new(ProxyConfig {
+    let store = Arc::new(Store::new(cli.history));
+    let config = ProxyConfig {
         target: target.clone(),
         cors: cli.cors,
-    })?;
+    };
+    let proxy = Proxy::new(config, store.clone())?;
 
-    let mut tasks = tokio::task::JoinSet::new();
-    for listener in bind(port).await? {
-        tasks.spawn(proxy.clone().serve(listener));
+    let runtime = tokio::runtime::Runtime::new().context("cannot start the runtime")?;
+    let listeners = runtime.block_on(bind(port))?;
+    for listener in listeners {
+        runtime.spawn(proxy.clone().serve(listener));
     }
-    println!("apibreak listening on http://localhost:{port} -> {target}");
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => result.context("waiting for Ctrl-C")?,
-        Some(result) = tasks.join_next() => result.context("proxy task failed")??,
-    }
-    Ok(())
+    tui::run(store, format!(":{port} -> {target}"))
 }

@@ -1,19 +1,27 @@
 mod support;
 
-use apibreak_core::{Proxy, ProxyConfig};
+use std::sync::Arc;
+use std::time::Duration;
+
+use apibreak_core::{Exchange, Outcome, Proxy, ProxyConfig, Store};
 use support::{backend, send, Backend};
 use tokio::net::TcpListener;
 
 async fn start_proxy(backend: &Backend, cors: bool) -> u16 {
+    start_recording(backend, cors).await.0
+}
+
+async fn start_recording(backend: &Backend, cors: bool) -> (u16, Arc<Store>) {
+    let store = Arc::new(Store::new(16));
     let config = ProxyConfig {
         target: format!("http://127.0.0.1:{}", backend.port),
         cors,
     };
-    let proxy = Proxy::new(config).expect("proxy");
+    let proxy = Proxy::new(config, store.clone()).expect("proxy");
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
     let port = listener.local_addr().expect("addr").port();
     tokio::spawn(proxy.serve(listener));
-    port
+    (port, store)
 }
 
 #[tokio::test]
@@ -152,4 +160,53 @@ async fn handles_concurrent_requests() {
         result.expect("request task");
     }
     assert_eq!(backend.hit_count(), 32);
+}
+
+/// The exchange is finished just after the client has the last byte.
+async fn finished(store: &Store) -> Arc<Exchange> {
+    for _ in 0..200 {
+        match store.snapshot().last() {
+            Some(entry) if entry.outcome != Outcome::Pending => return entry.clone(),
+            _ => tokio::time::sleep(Duration::from_millis(5)).await,
+        }
+    }
+    panic!("exchange never finished");
+}
+
+#[tokio::test]
+async fn records_request_and_response() {
+    let backend = backend("").await;
+    let (port, store) = start_recording(&backend, true).await;
+
+    send(port, "POST", "/api/login?next=1", "", "secret")
+        .await
+        .expect("reply");
+
+    let entry = finished(&store).await;
+    assert_eq!(entry.method, "POST");
+    assert_eq!(entry.path, "/api/login");
+    assert_eq!(entry.uri, "/api/login?next=1");
+    assert_eq!(&entry.request_body.bytes[..], b"secret");
+    let Outcome::Response(response) = &entry.outcome else {
+        panic!("expected response, got {:?}", entry.outcome);
+    };
+    assert_eq!(response.status, 200);
+    assert!(!response.body.truncated);
+    assert!(String::from_utf8_lossy(&response.body.bytes).contains("POST /api/login"));
+    assert!(entry.duration.is_some());
+}
+
+#[tokio::test]
+async fn offers_backend_only_gzip_when_browser_accepts_encodings() {
+    let backend = backend("").await;
+    let port = start_proxy(&backend, true).await;
+
+    let extra = "Accept-Encoding: gzip, deflate, br, zstd\r\n";
+    let reply = send(port, "GET", "/", extra, "").await.expect("reply");
+
+    assert!(
+        reply.body.contains("accept-encoding: gzip\r\n"),
+        "{}",
+        reply.body
+    );
 }
