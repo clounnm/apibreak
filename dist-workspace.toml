@@ -4,10 +4,7 @@ members = ["cargo:."]
 [dist]
 cargo-dist-version = "0.32.0"
 ci = "github"
-installers = ["shell", "powershell", "homebrew"]
-tap = "clounnm/homebrew-tap"
-formula = "apibreak"
-publish-jobs = ["homebrew"]
+installers = ["shell", "powershell"]
 targets = [
   "aarch64-apple-darwin",
   "aarch64-pc-windows-msvc",

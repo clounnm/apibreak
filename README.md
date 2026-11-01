@@ -18,13 +18,6 @@ proxy.
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/clounnm/apibreak/releases/latest/download/apibreak-installer.sh | sh
 ```
 
-Or use one of these:
-
-```sh
-brew install clounnm/tap/apibreak
-cargo install apibreak
-```
-
 On Windows:
 
 ```powershell

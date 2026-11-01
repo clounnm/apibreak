@@ -12,6 +12,8 @@ Ideas deliberately left out of the first version. None of them is promised.
 - Keeping comments when saving `scenarios.yaml`
 - A choice between `:id` patterns and exact paths when pressing a scenario key
 - Export of recorded traffic to HAR
+- Installing with Homebrew
+- Installing with `cargo install apibreak` from crates.io
 
 Out of scope by design: HTTPS interception, CA certificates and system proxy
 settings.
