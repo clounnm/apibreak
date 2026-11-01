@@ -7,6 +7,7 @@
 //! features off, bodies reach the browser exactly as the backend sent them.
 
 use std::convert::Infallible;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{ready, Context, Poll};
@@ -25,6 +26,7 @@ use tokio::net::TcpListener;
 use url::Url;
 
 use crate::error::{Error, Result};
+use crate::mock::MockStore;
 use crate::scenario::{Action, Plan, Scenario, ScenarioHandle};
 use crate::store::{Captured, Headers, NewExchange, Outcome, ResponseRecord, Store, CAPTURE_LIMIT};
 use crate::{body as body_view, cors};
@@ -43,6 +45,8 @@ pub struct ProxyConfig {
     pub target: String,
     /// Answer preflights and add CORS headers for localhost origins.
     pub cors: bool,
+    /// Directory that relative mock paths start from.
+    pub config_dir: PathBuf,
 }
 
 /// A cheaply cloneable handle to the running proxy state.
@@ -58,6 +62,7 @@ struct Inner {
     client: reqwest::Client,
     store: Arc<Store>,
     scenarios: ScenarioHandle,
+    mocks: MockStore,
 }
 
 /// Makes hyper close the connection without writing a response.
@@ -87,6 +92,7 @@ impl Proxy {
                 client,
                 store,
                 scenarios,
+                mocks: MockStore::new(config.config_dir),
             }),
         })
     }
@@ -168,7 +174,7 @@ impl Proxy {
                 tokio::time::sleep(delay).await;
             }
             if let Some(scenario) = response {
-                let response = match self.scenario_response(&scenario) {
+                let response = match self.scenario_response(&scenario).await {
                     Some(response) => response,
                     None => {
                         recording.failure = Some("connection dropped by scenario".to_owned());
@@ -185,14 +191,38 @@ impl Proxy {
     }
 
     /// Builds the response a scenario calls for; `None` drops the connection.
-    fn scenario_response(&self, scenario: &Scenario) -> Option<Response<ProxyBody>> {
+    async fn scenario_response(&self, scenario: &Scenario) -> Option<Response<ProxyBody>> {
         Some(match &scenario.action {
             Action::Status(status) => status_response(*status),
             Action::Empty => self.empty_response(scenario),
             Action::Offline => return None,
+            Action::Mock(file) => self.mock_response(file).await,
             // Delays are applied before this point and never decide a response.
             Action::Delay(_) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "invalid plan"),
         })
+    }
+
+    /// A broken mock is reported as a 502 rather than silently forwarded, so
+    /// the developer sees it instead of testing against the wrong data.
+    async fn mock_response(&self, file: &str) -> Response<ProxyBody> {
+        let mock = match self.inner.mocks.load(file).await {
+            Ok(mock) => mock,
+            Err(error) => return error_response(StatusCode::BAD_GATEWAY, &error.to_string()),
+        };
+        let Ok(status) = StatusCode::from_u16(mock.status) else {
+            let message = format!("mock {file} has invalid status {}", mock.status);
+            return error_response(StatusCode::BAD_GATEWAY, &message);
+        };
+        let mut headers = HeaderMap::new();
+        for (name, value) in &mock.headers {
+            if let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(value),
+            ) {
+                headers.append(name, value);
+            }
+        }
+        respond(status, headers, mock.body_bytes())
     }
 
     /// `[]` if the endpoint last answered with an array, otherwise 204.
@@ -515,6 +545,7 @@ mod tests {
         let config = ProxyConfig {
             target: "https://api.example.com/v1/".into(),
             cors: true,
+            config_dir: PathBuf::new(),
         };
         let scenarios = ScenarioHandle::new(Default::default());
         let proxy = Proxy::new(config, Arc::new(Store::new(1)), scenarios).expect("proxy");
@@ -544,6 +575,7 @@ mod tests {
             let config = ProxyConfig {
                 target: target.into(),
                 cors: true,
+                config_dir: PathBuf::new(),
             };
             let result = Proxy::new(
                 config,

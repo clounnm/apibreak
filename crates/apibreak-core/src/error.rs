@@ -16,6 +16,14 @@ pub enum Error {
     },
     #[error("invalid scenario: {0}")]
     InvalidScenario(String),
+    #[error("cannot record mock: {0}")]
+    CannotRecord(String),
+    #[error("invalid mock {file}: {source}")]
+    InvalidMock {
+        file: String,
+        #[source]
+        source: serde_json::Error,
+    },
     #[error("accepting connection failed: {0}")]
     Accept(#[source] std::io::Error),
 }

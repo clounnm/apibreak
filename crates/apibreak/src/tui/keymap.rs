@@ -23,6 +23,9 @@ pub enum Action {
     CloseHelp,
     Break(Break),
     ClearScenarios,
+    Record,
+    EditMock,
+    ToggleMock,
 }
 
 /// A scenario key.
@@ -73,6 +76,9 @@ fn normal(code: KeyCode) -> Option<Action> {
         KeyCode::Char('d') => Action::Break(Break::Delay),
         KeyCode::Char('o') => Action::Break(Break::Offline),
         KeyCode::Char('x') => Action::ClearScenarios,
+        KeyCode::Char('r') => Action::Record,
+        KeyCode::Char('E') => Action::EditMock,
+        KeyCode::Char('m') => Action::ToggleMock,
         _ => return None,
     })
 }

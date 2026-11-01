@@ -96,6 +96,8 @@ pub enum Action {
     Delay(Duration),
     /// Close the connection without answering.
     Offline,
+    /// Answer from this mock file, relative to the configuration directory.
+    Mock(String),
 }
 
 impl Action {
@@ -105,6 +107,7 @@ impl Action {
             Self::Empty => "empty".to_owned(),
             Self::Delay(delay) => format!("delay {}", format_duration(*delay)),
             Self::Offline => "offline".to_owned(),
+            Self::Mock(_) => "mock".to_owned(),
         }
     }
 }
@@ -127,6 +130,8 @@ struct RawScenario {
     status: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     delay: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file: Option<String>,
 }
 
 impl TryFrom<RawScenario> for Scenario {
@@ -144,6 +149,7 @@ impl TryFrom<RawScenario> for Scenario {
                 Action::Delay(parse_duration(delay)?)
             }
             "offline" => Action::Offline,
+            "mock" => Action::Mock(raw.file.clone().ok_or_else(|| missing("file"))?),
             other => {
                 return Err(Error::InvalidScenario(format!(
                     "unknown action `{other}` for `{}`",
@@ -162,6 +168,7 @@ impl From<Scenario> for RawScenario {
             action: String::new(),
             status: None,
             delay: None,
+            file: None,
         };
         raw.action = match scenario.action {
             Action::Status(status) => {
@@ -174,6 +181,10 @@ impl From<Scenario> for RawScenario {
                 "delay"
             }
             Action::Offline => "offline",
+            Action::Mock(file) => {
+                raw.file = Some(file);
+                "mock"
+            }
         }
         .to_owned();
         raw

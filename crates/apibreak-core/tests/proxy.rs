@@ -1,10 +1,12 @@
 mod support;
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use apibreak_core::{
-    Action, Exchange, Outcome, Proxy, ProxyConfig, Scenario, ScenarioHandle, ScenarioSet, Store,
+    Action, Exchange, Mock, MockStore, Outcome, Proxy, ProxyConfig, Scenario, ScenarioHandle,
+    ScenarioSet, Store,
 };
 use support::{backend, send, Backend};
 use tokio::net::TcpListener;
@@ -23,11 +25,21 @@ async fn start_with(
     cors: bool,
     scenarios: ScenarioSet,
 ) -> (u16, Arc<Store>, ScenarioHandle) {
+    start_in(Path::new("."), backend, cors, scenarios).await
+}
+
+async fn start_in(
+    config_dir: &Path,
+    backend: &Backend,
+    cors: bool,
+    scenarios: ScenarioSet,
+) -> (u16, Arc<Store>, ScenarioHandle) {
     let scenarios = ScenarioHandle::new(scenarios);
     let store = Arc::new(Store::new(16));
     let config = ProxyConfig {
         target: format!("http://127.0.0.1:{}", backend.port),
         cors,
+        config_dir: config_dir.to_path_buf(),
     };
     let proxy = Proxy::new(config, store.clone(), scenarios.clone()).expect("proxy");
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
@@ -354,4 +366,61 @@ async fn scenarios_take_effect_without_a_restart() {
         send(port, "GET", "/a", "", "").await.expect("reply").status,
         200
     );
+}
+
+#[tokio::test]
+async fn record_then_mock_replays_without_the_backend_and_sees_edits() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let backend = support::json_backend(r#"{"name":"real"}"#).await;
+    let (port, store, handle) =
+        start_in(directory.path(), &backend, true, ScenarioSet::default()).await;
+    let mocks = MockStore::new(directory.path());
+
+    send(port, "GET", "/api/me", "", "").await.expect("reply");
+    let entry = finished(&store).await;
+    let endpoint: apibreak_core::Endpoint = "GET /api/me".parse().expect("endpoint");
+    let file = mocks
+        .save(&endpoint, &Mock::from_exchange(&entry).expect("mock"))
+        .expect("save");
+    handle.update(|set| {
+        set.toggle(Scenario {
+            endpoint: endpoint.clone(),
+            action: Action::Mock(file.clone()),
+        });
+    });
+
+    let reply = send(port, "GET", "/api/me", "", "").await.expect("reply");
+    assert_eq!(reply.status, 200);
+    assert_eq!(reply.body, r#"{"name":"real"}"#);
+    assert_eq!(
+        reply.header("content-type").as_deref(),
+        Some("application/json")
+    );
+    assert_eq!(
+        backend.hit_count(),
+        1,
+        "the mock must not reach the backend"
+    );
+
+    let path = directory.path().join(&file);
+    let edited = std::fs::read_to_string(&path)
+        .expect("read")
+        .replace("real", "edited");
+    std::fs::write(&path, edited).expect("write");
+    let reply = send(port, "GET", "/api/me", "", "").await.expect("reply");
+    assert_eq!(reply.body, r#"{"name":"edited"}"#);
+}
+
+#[tokio::test]
+async fn missing_mock_is_a_visible_error() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let backend = backend("").await;
+    let set = scenarios("GET /a", Action::Mock("mocks/none.json".into()));
+    let (port, _, _) = start_in(directory.path(), &backend, true, set).await;
+
+    let reply = send(port, "GET", "/a", "", "").await.expect("reply");
+
+    assert_eq!(reply.status, 502);
+    assert!(reply.body.contains("mocks/none.json"), "{}", reply.body);
+    assert_eq!(backend.hit_count(), 0);
 }

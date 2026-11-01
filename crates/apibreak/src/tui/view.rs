@@ -240,7 +240,14 @@ fn body_lines(lines: &mut Vec<Line<'static>>, headers: &Headers, captured: &Capt
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
-    let line = if app.mode == Mode::Filter {
+    let line = if let Some(message) = &app.message {
+        let text_style = if message.is_error {
+            style::error()
+        } else {
+            style::accent()
+        };
+        Line::styled(message.text.clone(), text_style)
+    } else if app.mode == Mode::Filter {
         Line::from(vec![
             Span::styled("/", style::accent()),
             Span::raw(app.filter.clone()),
@@ -255,7 +262,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             ));
         }
         spans.push(Span::styled(
-            "5/4/n/e/d/o break  x fix  / filter  Tab pane  p pause  ? help  q quit",
+            "5 4 n e d o break  m mock  r record  x fix  / filter  ? help  q quit",
             style::muted(),
         ));
         Line::from(spans)
@@ -274,7 +281,10 @@ const HELP: &[(&str, &str)] = &[
     ("e", "empty response, [] for arrays"),
     ("d", "delay the response"),
     ("o", "offline: drop the connection"),
+    ("m", "serve the recorded mock"),
     ("x", "remove scenarios from endpoint"),
+    ("r", "record response as a mock"),
+    ("E", "edit the mock in $EDITOR"),
     ("c", "clear list"),
     ("p", "pause recording"),
     ("q", "quit"),
@@ -312,7 +322,7 @@ mod tests {
     use std::sync::Arc;
 
     use apibreak_core::store::{NewExchange, ResponseRecord};
-    use apibreak_core::{ScenarioHandle, ScenarioSet, Store};
+    use apibreak_core::{MockStore, ScenarioHandle, ScenarioSet, Store};
     use bytes::Bytes;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -325,6 +335,7 @@ mod tests {
         App::new(
             store,
             scenarios,
+            MockStore::new("."),
             std::time::Duration::from_secs(3),
             title.into(),
         )

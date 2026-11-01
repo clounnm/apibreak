@@ -2,11 +2,13 @@
 //! event channel, so the render loop never touches shared locks.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use apibreak_core::{
-    Action as Effect, Exchange, Scenario, ScenarioHandle, ScenarioSet, Store, StoreEvent,
+    Action as Effect, Endpoint, Exchange, Mock, MockStore, Scenario, ScenarioHandle, ScenarioSet,
+    Store, StoreEvent,
 };
 use ratatui::text::Line;
 
@@ -26,6 +28,12 @@ pub enum Focus {
     Details,
 }
 
+/// Feedback shown in the footer until the next key press.
+pub struct Message {
+    pub text: String,
+    pub is_error: bool,
+}
+
 /// The rendered details of one exchange; rebuilt only when it changes.
 struct DetailCache {
     exchange: Arc<Exchange>,
@@ -35,6 +43,7 @@ struct DetailCache {
 pub struct App {
     store: Arc<Store>,
     scenarios: ScenarioHandle,
+    mocks: MockStore,
     default_delay: Duration,
     /// Active scenarios as last seen on the watch channel.
     pub active: Arc<ScenarioSet>,
@@ -51,6 +60,9 @@ pub struct App {
     /// Rows of the details panel, set while drawing, for clamping the scroll.
     pub detail_max_scroll: u16,
     pub should_quit: bool,
+    pub message: Option<Message>,
+    /// A mock waiting to be opened in the editor by the event loop.
+    pub pending_edit: Option<String>,
     cache: Option<DetailCache>,
 }
 
@@ -58,6 +70,7 @@ impl App {
     pub fn new(
         store: Arc<Store>,
         scenarios: ScenarioHandle,
+        mocks: MockStore,
         default_delay: Duration,
         title: String,
     ) -> Self {
@@ -65,6 +78,7 @@ impl App {
             store,
             active: scenarios.current(),
             scenarios,
+            mocks,
             default_delay,
             title,
             entries: VecDeque::new(),
@@ -77,6 +91,8 @@ impl App {
             detail_scroll: 0,
             detail_max_scroll: 0,
             should_quit: false,
+            message: None,
+            pending_edit: None,
             cache: None,
         }
     }
@@ -158,6 +174,7 @@ impl App {
     }
 
     pub fn handle(&mut self, action: Action) {
+        self.message = None;
         match action {
             Action::Quit => self.should_quit = true,
             Action::Down => self.move_by(1),
@@ -192,12 +209,13 @@ impl App {
             Action::CloseHelp => self.mode = Mode::Normal,
             Action::Break(kind) => self.toggle_scenario(kind),
             Action::ClearScenarios => {
-                if let Some(exchange) = self.selected() {
-                    let current = self.scenarios.current();
-                    let endpoint = current.endpoint_for(&exchange.method, &exchange.path);
+                if let Some((_, endpoint)) = self.selection() {
                     self.scenarios.update(|set| set.clear(&endpoint));
                 }
             }
+            Action::Record => self.record(),
+            Action::EditMock => self.edit_mock(),
+            Action::ToggleMock => self.toggle_mock(),
         }
     }
 
@@ -206,8 +224,82 @@ impl App {
         self.scenarios.current()
     }
 
+    /// The selected exchange and the endpoint keys act on.
+    fn selection(&self) -> Option<(Arc<Exchange>, Endpoint)> {
+        let exchange = self.selected()?;
+        let current = self.scenarios.current();
+        let endpoint = current.endpoint_for(&exchange.method, &exchange.path);
+        Some((exchange, endpoint))
+    }
+
+    fn inform(&mut self, text: String) {
+        self.message = Some(Message {
+            text,
+            is_error: false,
+        });
+    }
+
+    fn fail(&mut self, text: String) {
+        self.message = Some(Message {
+            text,
+            is_error: true,
+        });
+    }
+
+    fn record(&mut self) {
+        let Some((exchange, endpoint)) = self.selection() else {
+            return;
+        };
+        let saved =
+            Mock::from_exchange(&exchange).and_then(|mock| self.mocks.save(&endpoint, &mock));
+        match saved {
+            Ok(file) => self.inform(format!("saved {file}, press m to serve it")),
+            Err(error) => self.fail(error.to_string()),
+        }
+    }
+
+    fn edit_mock(&mut self) {
+        let Some((_, endpoint)) = self.selection() else {
+            return;
+        };
+        let file = MockStore::file_for(&endpoint);
+        if self.mocks.exists(&file) {
+            self.pending_edit = Some(file);
+        } else {
+            self.fail(format!("no mock for {endpoint}, press r to record one"));
+        }
+    }
+
+    fn toggle_mock(&mut self) {
+        let Some((_, endpoint)) = self.selection() else {
+            return;
+        };
+        let file = MockStore::file_for(&endpoint);
+        if !self.mocks.exists(&file) {
+            self.fail(format!("no mock for {endpoint}, press r to record one"));
+            return;
+        }
+        let action = Effect::Mock(file);
+        self.scenarios
+            .update(|set| set.toggle(Scenario { endpoint, action }));
+    }
+
+    /// The path to hand to the editor for a mock file.
+    pub fn mock_path(&self, file: &str) -> Option<PathBuf> {
+        self.mocks.resolve(file).ok()
+    }
+
+    /// Reports on a mock after the editor closes. Changes need no reloading
+    /// because the proxy reads mock files on every request.
+    pub fn after_edit(&mut self, file: &str, result: Result<(), String>) {
+        match result.and_then(|()| self.mocks.validate(file).map_err(|error| error.to_string())) {
+            Ok(()) => self.inform(format!("{file} updated")),
+            Err(error) => self.fail(error),
+        }
+    }
+
     fn toggle_scenario(&mut self, kind: Break) {
-        let Some(exchange) = self.selected() else {
+        let Some((_, endpoint)) = self.selection() else {
             return;
         };
         let action = match kind {
@@ -218,8 +310,6 @@ impl App {
             Break::Delay => Effect::Delay(self.default_delay),
             Break::Offline => Effect::Offline,
         };
-        let current = self.scenarios.current();
-        let endpoint = current.endpoint_for(&exchange.method, &exchange.path);
         self.scenarios
             .update(|set| set.toggle(Scenario { endpoint, action }));
     }
@@ -286,7 +376,14 @@ mod tests {
 
     fn new_app(store: Arc<Store>) -> App {
         let scenarios = ScenarioHandle::new(ScenarioSet::default());
-        App::new(store, scenarios, Duration::from_secs(3), String::new())
+        let mocks = MockStore::new(std::env::temp_dir().join("apibreak-no-mocks-here"));
+        App::new(
+            store,
+            scenarios,
+            mocks,
+            Duration::from_secs(3),
+            String::new(),
+        )
     }
 
     /// An app with `paths` already delivered through the event channel.
@@ -406,6 +503,20 @@ mod tests {
         app.handle(Action::Break(Break::Offline));
         app.handle(Action::ClearScenarios);
         assert!(app.scenarios.current().is_empty());
+    }
+
+    #[test]
+    fn mock_keys_explain_when_nothing_was_recorded() {
+        let mut app = app_with(&["/a"]);
+        app.handle(Action::ToggleMock);
+        assert!(app.message.as_ref().is_some_and(|message| message.is_error));
+        assert!(app.scenarios.current().is_empty());
+
+        app.handle(Action::EditMock);
+        assert!(app.pending_edit.is_none());
+
+        app.handle(Action::Down);
+        assert!(app.message.is_none(), "any key clears the message");
     }
 
     #[test]

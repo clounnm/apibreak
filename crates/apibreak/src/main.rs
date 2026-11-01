@@ -7,11 +7,12 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use apibreak_core::scenario::{parse_duration, DEFAULT_DELAY};
 use apibreak_core::store::DEFAULT_CAPACITY;
-use apibreak_core::{Proxy, ProxyConfig, ScenarioHandle, ScenarioSet, Store};
+use apibreak_core::{MockStore, Proxy, ProxyConfig, ScenarioHandle, ScenarioSet, Store};
 use clap::{ArgAction, Parser};
 use tokio::net::TcpListener;
 
 const DEFAULT_PORT: u16 = 4000;
+const CONFIG_DIR: &str = ".apibreak";
 
 /// Break your API with one key: no certificates, no scripts.
 #[derive(Debug, Parser)]
@@ -58,6 +59,7 @@ fn main() -> Result<()> {
     let config = ProxyConfig {
         target: target.clone(),
         cors: cli.cors,
+        config_dir: CONFIG_DIR.into(),
     };
     let scenarios = ScenarioHandle::new(ScenarioSet::default());
     let proxy = Proxy::new(config, store.clone(), scenarios.clone())?;
@@ -68,5 +70,12 @@ fn main() -> Result<()> {
         runtime.spawn(proxy.clone().serve(listener));
     }
     let delay = cli.delay.unwrap_or(DEFAULT_DELAY);
-    tui::run(store, scenarios, delay, format!(":{port} -> {target}"))
+    let mocks = MockStore::new(CONFIG_DIR);
+    tui::run(
+        store,
+        scenarios,
+        mocks,
+        delay,
+        format!(":{port} -> {target}"),
+    )
 }
