@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/clounnm/apibreak"
@@ -12,3 +12,7 @@ homepage = "https://github.com/clounnm/apibreak"
 [profile.release]
 lto = "thin"
 strip = true
+
+# dist builds with this profile.
+[profile.dist]
+inherits = "release"
