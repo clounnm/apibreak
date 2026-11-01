@@ -6,7 +6,8 @@ members = ["crates/*"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/apibreak/apibreak"
+repository = "https://github.com/clounnm/apibreak"
+homepage = "https://github.com/clounnm/apibreak"
 
 [profile.release]
 lto = "thin"
